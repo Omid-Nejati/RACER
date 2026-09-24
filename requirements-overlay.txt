@@ -1,0 +1,6 @@
+# The integration is designed to run in the existing MCoT/Qwen2.5-VL venv.
+# Do NOT install OTT's original environment on top of it.
+# Known compatible baseline used by this project:
+transformers==4.49.0
+huggingface-hub>=0.26.0,<1.0
+accelerate>=1.0.1

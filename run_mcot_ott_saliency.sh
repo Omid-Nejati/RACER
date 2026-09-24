@@ -8,10 +8,13 @@ NUM_SAMPLES="${NUM_SAMPLES:-2}"
 GPU="${GPU:-0}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-256}"
 METHODS="${METHODS:-mcot,ott,sgrs,locore}"
-OUTPUT="${OUTPUT:-results/mcot_ott_saliency_${NUM_SAMPLES}.json}"
+PRESET="${PRESET:-port}"            # port = previous stacking, ours = all novelties
+OUTPUT="${OUTPUT:-results/${PRESET}_${NUM_SAMPLES}.json}"
+EXTRA_ARGS="${EXTRA_ARGS:-}"        # e.g. "--router always" for an ablation row
 
 mkdir -p "$(dirname "$OUTPUT")"
 
+# shellcheck disable=SC2086
 CUDA_VISIBLE_DEVICES="$GPU" python generate_chair_all.py \
   --input "$INPUT" \
   --output "$OUTPUT" \
@@ -20,10 +23,11 @@ CUDA_VISIBLE_DEVICES="$GPU" python generate_chair_all.py \
   --num_samples "$NUM_SAMPLES" \
   --max_new_tokens "$MAX_NEW_TOKENS" \
   --methods "$METHODS" \
+  --preset "$PRESET" \
   --attn_implementation eager \
   --seed "${SEED:-1994}" \
   --activation_alpha "${ACTIVATION_ALPHA:-0.75}" \
-  --activation_info_layer "${ACTIVATION_INFO_LAYER:--1}" \
+  --activation_info_layer="${ACTIVATION_INFO_LAYER:--1}" \
   --activation_threshold "${ACTIVATION_THRESHOLD:-0.5}" \
   --crc_lambda "${CRC_LAMBDA:-0.1111}" \
   --svc_ratio "${SVC_RATIO:-0.06}" \
@@ -35,4 +39,5 @@ CUDA_VISIBLE_DEVICES="$GPU" python generate_chair_all.py \
   --saliency_query_mode "${SALIENCY_QUERY_MODE:-predictor}" \
   --locore_beta "${LOCORE_BETA:-0.20}" \
   --locore_window "${LOCORE_WINDOW:-5}" \
-  --locore_layers "${LOCORE_LAYERS:-all}"
+  --locore_layers "${LOCORE_LAYERS:-all}" \
+  $EXTRA_ARGS

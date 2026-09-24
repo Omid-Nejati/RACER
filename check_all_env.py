@@ -26,6 +26,8 @@ try:
     import generate_chair
     import ott_qwen
     import saliency_qwen
+    import mcot_plus
+    import risk_router
     print("MCoT + OTT + Saliency imports: OK")
 except Exception as e:
     raise SystemExit(f"integration import failed: {e}")

@@ -8,6 +8,19 @@ It intentionally does **not** copy or replace third-party repository source.
 The original MCoT `generate_chair.py`, `chair.py`, `chair.pkl`, model, and COCO
 data remain the host environment.
 
+## Novelties (see NOVELTY.md)
+
+```bash
+# previous plain stacking (bit-identical to the old integration)
+PRESET=port METHODS=mcot,ott,sgrs,locore bash run_mcot_ott_saliency.sh
+# all novelties: AVEG + TRACE + SGRS+ + LocoRE+ + risk router
+PRESET=ours METHODS=mcot,ott,sgrs,locore bash run_mcot_ott_saliency.sh
+# paper tables: A = stacking, B = "ours minus X"
+TABLE=both NUM_SAMPLES=500 bash run_ablation_matrix.sh
+# CPU tests on a tiny random Qwen2.5-VL (no weights needed)
+cd tests && python -m pytest -q
+```
+
 ## What is combined
 
 At every decoding step the effective pipeline is:

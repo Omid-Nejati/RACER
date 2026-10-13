@@ -1,304 +1,210 @@
-# MCoT + OTT + LVLMs-Saliency (Qwen2.5-VL / GRIT integration)
+# RACER: Reasoning-Aware Coherence and Evidence Recalibration
 
-This repository is an **overlay** for the existing `ASGO-MM/MCoT-hallucination`
-checkout.  It adds the previous OTT Qwen port plus a Qwen2.5-VL port of the
-ICLR 2026 paper **Hallucination Begins Where Saliency Drops**.
+**Training-Free Hallucination Mitigation in Multimodal Reasoning**
 
-It intentionally does **not** copy or replace third-party repository source.
-The original MCoT `generate_chair.py`, `chair.py`, `chair.pkl`, model, and COCO
-data remain the host environment.
+RACER is a training-free inference framework designed to reduce hallucination during **multimodal chain-of-thought reasoning and final-answer generation**. Rather than applying the same correction to every token, RACER estimates the reliability of each decoding step and selectively recalibrates visual evidence, verifies candidate tokens, and reinforces useful reasoning context.
 
-## Novelties (see NOVELTY.md)
+The framework operates on **frozen multimodal large language models (MLLMs)**: no fine-tuning, additional trainable modules, or parameter updates are required. The current implementation targets **Qwen2.5-VL-compatible architectures**, including the GRIT reasoning model used in the experiments.
+
+## Overview
+
+A grounding error that emerges within an intermediate reasoning step can influence later generated tokens, even when the resulting answer appears linguistically coherent. RACER treats hallucination mitigation as a **reasoning–evidence–coherence control problem**, with three complementary goals:
+
+1. **Identify unreliable reasoning states:** estimate whether candidate predictions receive concentrated visual support.
+2. **Recalibrate visual evidence when necessary:** retrieve relevant visual representations rather than indiscriminately modifying every decoding state.
+3. **Verify and preserve grounded generation:** check candidate dependency on both the image and the preceding reasoning context, then reinforce informative dependencies at subsequent steps.
+
+### Risk-adaptive inference
+
+```mermaid
+flowchart TD
+    A[Image + question] --> B[Frozen MLLM]
+    B --> C[RDE: Reasoning Divergence Estimation]
+    C --> D{Hallucination-Risk Router}
+    D -->|Low risk| E[Entropy-adjusted greedy decoding]
+    D -->|High risk| F[VER: Visual Evidence Recalibration]
+    F --> G[GSV: Grounded Saliency Verification]
+    G --> H[ACR: Adaptive Context Reinforcement]
+    E --> I[Next token / updated reasoning context]
+    H --> I
+    I -->|Autoregressive next step| B
+```
+
+At each step, the router uses a risk estimate derived from visual uncertainty, prior-token grounding saliency, and model confidence. High-risk steps receive stronger correction; low-risk steps retain a lighter inference path. The diagram summarizes the intended procedure; the current code implements it with inference-time activation, logit, attention, and candidate-selection operations.
+
+## Main methodological contributions
+
+### 1. Reasoning Divergence Estimation (RDE)
+
+RDE measures candidate-aware visual-support uncertainty across multiple decoder layers. It projects visual-token representations into vocabulary space, estimates spatial entropy for each candidate, and aggregates entropy over the current Top-K candidate distribution. A continuous gate and reasoning/answer phase scaling determine the strength of the logit adjustment.
+
+**Distinctive elements:** multi-layer visual entropy, candidate-expected uncertainty, smooth gating, and phase-aware correction.
+
+### 2. Visual Evidence Recalibration (VER)
+
+VER maintains an image-conditioned representation direction and retrieves step-relevant visual context from cached visual reference representations. It prioritizes informative visual positions using attention, keeps the retrieval and fusion representations in a consistent space, and activates stronger retracing selectively through the risk router.
+
+**Distinctive elements:** decode-only visual steering, attention-prioritized reference memory, MLP-space visual retrieval, relevance-aware gating, and routed retracing.
+
+### 3. Grounded Saliency Verification (GSV)
+
+GSV evaluates candidate tokens using gradient-weighted attention to **both previously generated context and visual input positions**. It normalizes these signals with recent saliency statistics, uses visual uncertainty to set candidate-specific acceptance thresholds, and provides a probability–saliency calibrated fallback when the candidate pool is exhausted.
+
+**Distinctive elements:** joint visual/textual grounding, uncertainty-aware verification, and confidence-sensitive fallback.
+
+### 4. Adaptive Context Reinforcement (ACR)
+
+ACR increases attention toward recent generated tokens when contextual grounding weakens. It also maintains attention toward informative visual anchors, reducing the likelihood that later reasoning steps drift away from image-supported evidence.
+
+**Distinctive elements:** saliency-adaptive local reinforcement and visual-anchor attention bias.
+
+### 5. Hallucination-Risk Router
+
+The router coordinates these operations using a token-level risk score:
+
+$$
+r_t = w_E g_t^E + w_S g_t^S + w_C (1-p_t^{\max})
+$$
+
+where $g_t^E$ is visual uncertainty, $g_t^S$ measures a decline in grounding saliency, and $p_t^{\max}$ is the model's maximum next-token confidence. Available terms are weight-normalized when a signal is missing.
+
+- **Low risk:** decode directly from the RDE-adjusted distribution.
+- **High risk:** enable stronger visual-context retracing, perform grounded candidate verification when required, and adapt contextual reinforcement for the following step.
+
+The central contribution is the **coupling of reliability estimation with the inference decision**, so both the location and intensity of intervention depend on the evolving reasoning trajectory.
+
+## Repository layout
+
+| File or directory | Purpose |
+|---|---|
+| `generate_chair_all.py` | Main autoregressive generation and intervention loop |
+| `mcot_plus.py` / `src/mcot_plus.py` | RDE: visual-entropy estimation and candidate-aware logit adjustment |
+| `ott_qwen.py` / `src/ott_qwen.py` | VER: visual steering, reference selection, and retracing |
+| `saliency_qwen.py` / `src/saliency_qwen.py` | GSV and ACR: candidate verification and attention reinforcement |
+| `risk_router.py` / `src/risk_router.py` | Token-level hallucination-risk estimation and routing |
+| `run_mcot_ott_saliency.sh` | Main generation runner (legacy filename) |
+| `run_ablation_matrix.sh` | Component and control ablations |
+| `evaluate_all_chair.sh` | Object HalBench/CHAIR evaluation wrapper |
+| `tests/` | Implementation and regression tests |
+
+**Implementation note:** Some filenames and command-line switches retain historical names for backward compatibility. The scientific component names used in the paper are **RDE, VER, GSV, ACR, and Hallucination-Risk Router**.
+
+## Installation
+
+### Requirements
+
+- Python environment compatible with the Qwen2.5-VL model family.
+- A CUDA-capable GPU with sufficient memory for the selected checkpoint and gradient-based verification.
+- COCO images and associated annotations/cache for Object HalBench evaluation.
+- Model weights for the selected supported checkpoint.
+
+The current code was developed with `transformers==4.49.0`, `huggingface-hub>=0.26.0,<1.0`, and `accelerate>=1.0.1` (see `requirements-overlay.txt`). Additional dependencies come from the model and benchmark host environment.
+
+### Current installation workflow
+
+**The current public release is deployed into a compatible host evaluation environment; it is not yet a fully self-contained installer.** The target directory must contain compatible `generate_chair.py` and `chair.py` entry points.
 
 ```bash
-# previous plain stacking (bit-identical to the old integration)
-PRESET=port METHODS=mcot,ott,sgrs,locore bash run_mcot_ott_saliency.sh
-# all novelties: AVEG + TRACE + SGRS+ + LocoRE+ + risk router
-PRESET=ours METHODS=mcot,ott,sgrs,locore bash run_mcot_ott_saliency.sh
-# paper tables: A = stacking, B = "ours minus X"
-TABLE=both NUM_SAMPLES=500 bash run_ablation_matrix.sh
-# CPU tests on a tiny random Qwen2.5-VL (no weights needed)
-cd tests && python -m pytest -q
-```
+git clone https://github.com/Omid-Nejati/RACER.git
+cd RACER
 
-## What is combined
+# Copy RACER inference and evaluation scripts to the supported host checkout.
+bash scripts/install_into_mcot.sh /path/to/host-checkout
 
-At every decoding step the effective pipeline is:
-
-1. **OTT (CRC + SVC)** modifies Qwen decoder MLP activations using visual
-   references from the prompt.
-2. **MCoT activation decoding** computes/uses the visual-entropy penalty and
-   conditionally adjusts the next-token logits.
-3. **SGRS** takes Top-K candidates from those adjusted logits, computes
-   gradient-aware attention saliency for candidates, and rejects candidates
-   below the adaptive threshold.
-4. **LocoRE** reinforces attention to the most recent generated output tokens
-   on the next forward pass.
-
-All components can be independently enabled for ablations.
-
-## Source-method notes
-
-LVLMs-Saliency defines saliency as attention multiplied by its gradient,
-followed by head aggregation/L2 normalization.  SGRS uses Top-K candidates,
-an adaptive threshold based on recent accepted-token saliency, and a
-max-saliency fallback.  The public rejection-sampling script uses defaults
-`K=5`, `R=3`, `alpha=0.6`, history window `W=5`, and target layers `6,7,8`.
-The paper's Qwen2-VL ablation reports `beta=0.20` for LocoRE.
-
-Upstream sources:
-- https://github.com/ASGO-MM/MCoT-hallucination
-- https://github.com/Fazhan-cs/OTT
-- https://github.com/zhangbaijin/LVLMs-Saliency
-- https://arxiv.org/abs/2601.20279
-
-## Important reproducibility caveats
-
-### 1. Qwen2-VL -> Qwen2.5-VL / GRIT is a port
-
-The saliency paper's public Qwen code targets Qwen2-VL, while MCoT/GRIT here
-uses `Qwen2_5_VLForConditionalGeneration`.  This overlay is therefore a
-method-level port, not byte-for-byte execution of the authors' model fork.
-
-### 2. SGRS predictor-row correction
-
-The public `do_reject_sample.py` appends candidate `c`, forms the candidate loss
-from `outputs.logits[:, -2, :]`, but then reads the saliency at the **last**
-attention-query row.  In a standard causal decoder that last row cannot affect
-the already-computed likelihood of itself.  The default here is therefore:
-
-```text
---saliency_query_mode predictor
-```
-
-which reads the preceding causal query row (`T-2`) that actually produces the
-candidate logits.  For diagnostic comparison, `--saliency_query_mode repo`
-reproduces the public row choice.
-
-### 3. Portable LocoRE
-
-The paper multiplies attention weights to recent output keys by `(1 + beta)`.
-To avoid replacing Transformers' Qwen attention source, this overlay adds
-`log(1 + beta)` to those key positions in the additive causal mask.  After
-softmax this is the **renormalized equivalent** of the gain.  It is portable
-across the supported Qwen2.5-VL host version but is not a byte-identical copy of
-the authors' custom Qwen2-VL attention code.
-
-For a paper, describe it as a **Qwen2.5-VL port/adaptation** unless you also
-validate against the authors' exact Qwen2-VL implementation.
-
-## Install into your current server repository
-
-Your host repository is:
-
-```bash
-/data/o_nejati/MCoT-hallucination
-```
-
-Extract this overlay somewhere, then:
-
-```bash
-cd MCoT_OTT_LVLM_Saliency
-bash scripts/install_into_mcot.sh /data/o_nejati/MCoT-hallucination
-```
-
-This installs only:
-
-```text
-ott_qwen.py
-saliency_qwen.py
-generate_chair_all.py
-check_all_env.py
-run_mcot_ott_saliency.sh
-run_ablation_matrix.sh
-evaluate_all_chair.sh
-```
-
-It does not overwrite the original MCoT files.
-
-## Environment
-
-Use the **same `myvenv` that runs MCoT/Qwen2.5-VL**.  Do not install the OTT or
-LVLMs-Saliency original environments on top of it.
-
-```bash
-cd /data/o_nejati/MCoT-hallucination
-source myvenv/bin/activate
+cd /path/to/host-checkout
+source /path/to/your/venv/bin/activate
 python check_all_env.py
 python -m pip check
 ```
 
-Expected key import:
+The installation helper retains the host's original generation and CHAIR evaluation files.
 
-```text
-Qwen2_5_VLForConditionalGeneration: OK
-MCoT + OTT + Saliency imports: OK
-```
+## Run RACER
 
-The integration is designed around the environment you already repaired:
-`transformers==4.49.0` and `huggingface-hub<1.0`.
-
-## Data check
-
-Do not use `examples/coco_images.example.json` for a 500-sample run; it has only
-one record.  Use the repository's `coco_images.json` or your fixed 500-image
-input.
+Set paths appropriate for your system, and explicitly choose the **`ours` preset** to activate the RACER method:
 
 ```bash
-python - <<'PY'
-import json
-with open('coco_images.json') as f:
-    x = json.load(f)
-print('input records:', len(x))
-PY
-```
-
-Set your real COCO directory:
-
-```bash
-export IMAGE_ROOT=/real/path/to/coco/val2014
-```
-
-## First smoke test: Saliency only
-
-Start with **1 image and a short generation** because SGRS performs gradient
-forwards for candidate tokens and is much slower than the earlier MCoT+OTT
-run.
-
-```bash
-cd /data/o_nejati/MCoT-hallucination
-source myvenv/bin/activate
-
 export MODEL_ID='yfan1997/GRIT-20-Qwen2.5-VL-3B'
-export IMAGE_ROOT='/real/path/to/coco/val2014'
+export IMAGE_ROOT='/path/to/coco/val2014'
 export INPUT='coco_images.json'
-export NUM_SAMPLES=1
-export MAX_NEW_TOKENS=32
-export METHODS='sgrs,locore'
-export OUTPUT='results/saliency_smoke.json'
 export GPU=0
-
-bash run_mcot_ott_saliency.sh
-```
-
-Successful LocoRE execution should finish with a non-zero line such as:
-
-```text
-LocoRE mask applications: ...
-```
-
-If it reports that no 4-D mask was observed, keep `eager` attention and verify
-that your Transformers version is 4.49.0.
-
-## Full combined smoke test
-
-```bash
+export PRESET=ours
 export METHODS='mcot,ott,sgrs,locore'
+export SEED=1994
 export NUM_SAMPLES=2
 export MAX_NEW_TOKENS=64
-export OUTPUT='results/mcot_ott_saliency_smoke.json'
+export OUTPUT='results/racer_smoke.json'
+
 bash run_mcot_ott_saliency.sh
 ```
 
-## 500-image experiment
+The `METHODS` switch uses backward-compatible implementation identifiers. **`PRESET=ours` is important:** the current runner's default is `port`, a separate legacy reference configuration, not the proposed RACER setting.
 
-After the smoke test succeeds:
+For a larger Object HalBench generation run, change `NUM_SAMPLES` and `MAX_NEW_TOKENS` after confirming the smoke test works. Ensure `coco_images.json` contains the intended sample records and `IMAGE_ROOT` points to the corresponding image directory.
+
+## Evaluation
+
+To compute CHAIR metrics from a generated predictions file:
 
 ```bash
-export INPUT='coco_images.json'
-export NUM_SAMPLES=500
-export MAX_NEW_TOKENS=256
-export METHODS='mcot,ott,sgrs,locore'
-export OUTPUT='results/mcot_ott_saliency_500.json'
-bash run_mcot_ott_saliency.sh
+bash evaluate_all_chair.sh results/racer_smoke.json
 ```
 
-Verify record count before evaluation:
+The evaluation script uses the host's `chair.py` and `chair.pkl` files. Keep datasets, prompts, seeds, generation budgets, and model checkpoints fixed when comparing methods.
+
+## Ablations and reproducibility
+
+The repository includes configurable variants of visual-entropy estimation, visual-reference selection, candidate verification, local reinforcement, and routing. For a small preliminary ablation run:
 
 ```bash
-python - <<'PY'
-import json
-p='results/mcot_ott_saliency_500.json'
-with open(p) as f:
-    x=json.load(f)
-print('generated:', len(x))
-assert len(x)==500
-PY
-```
-
-## CHAIR evaluation
-
-```bash
-bash evaluate_all_chair.sh results/mcot_ott_saliency_500.json
-```
-
-Equivalent command:
-
-```bash
-python chair.py \
-  --cap_file results/mcot_ott_saliency_500.json \
-  --image_id_key image_id \
-  --caption_key model_answer \
-  --cache chair.pkl \
-  --save_path results/mcot_ott_saliency_500.metrics.json
-```
-
-## Recommended ablation matrix
-
-Use the exact same input JSON and seed for every setting:
-
-| Name | Methods |
-|---|---|
-| MCoT | `mcot` |
-| OTT port | `ott` |
-| LVLMs-Saliency port | `sgrs,locore` |
-| MCoT + OTT | `mcot,ott` |
-| MCoT + Saliency | `mcot,sgrs,locore` |
-| OTT + Saliency | `ott,sgrs,locore` |
-| Full | `mcot,ott,sgrs,locore` |
-
-For a small validation matrix:
-
-```bash
+export IMAGE_ROOT='/path/to/coco/val2014'
 export NUM_SAMPLES=10
-export IMAGE_ROOT='/real/path/to/coco/val2014'
-bash run_ablation_matrix.sh
+TABLE=b bash run_ablation_matrix.sh
 ```
 
-Do not launch the 500-image seven-way matrix until the saliency runtime and GPU
-memory are measured on 1-10 samples.
+`TABLE=b` selects the existing RACER component-ablation matrix. **Verify the exact behavior of each switch and regenerate benchmark metrics before using results in a paper.** In particular, `--router always` changes the correction policy and should be evaluated in conjunction with its visual-retracing configuration when interpreting the no-router comparison.
 
-## Main hyperparameters
+The generation output includes diagnostics such as per-token risk estimates, visual-entropy gates, saliency-verification decisions, retracing steps, and execution-time counters. These can be used to analyze *when* RACER intervenes and the cost of those interventions.
 
-### MCoT
-- `ACTIVATION_ALPHA=0.75`
-- `ACTIVATION_THRESHOLD=0.5`
-- `ACTIVATION_INFO_LAYER=-1`
+### Selected hyperparameters (current RACER preset)
 
-### OTT Qwen port
-- `CRC_LAMBDA=0.1111`
-- `SVC_RATIO=0.06`
+| Parameter | Value |
+|---|---|
+| RDE entropy layers | `-1,-6,-12` |
+| RDE candidate set / threshold / gate temperature | `5` / `0.5` / `0.05` |
+| RDE base adjustment strength | `0.75` |
+| VER steering coefficient / retrieval ratio | `0.1111` / `0.06` |
+| Visual reference limit | `128` |
+| GSV candidate set / max rejection attempts | `5` / `3` |
+| GSV visual-saliency weight / entropy coupling | `0.3` / `0.5` |
+| ACR base / maximum local reinforcement | `0.20` / `0.60` |
+| ACR visual-anchor strength / anchor count | `0.10` / `32` |
+| Risk weights (entropy / saliency / confidence) | `0.5` / `0.3` / `0.2` |
+| Risk threshold / verification confidence skip | `0.5` / `0.95` |
 
-### LVLMs-Saliency Qwen2.5 port
-- `SGRS_TOP_K=5`
-- `SGRS_MAX_RESAMPLE=3`
-- `SGRS_ALPHA=0.6`
-- `SGRS_HISTORY_WINDOW=5`
-- `SGRS_TARGET_LAYERS=6,7,8`
-- `SALIENCY_QUERY_MODE=predictor`
-- `LOCORE_BETA=0.20`
-- `LOCORE_WINDOW=5`
+### Reproducibility considerations
 
-## Output traces
+- Grounded saliency uses model-internal attention gradients, so output-only inference APIs are insufficient.
+- Gradient-based candidate verification increases inference time and memory use; benchmark hardware should be reported.
+- The current implementation is Qwen2.5-VL-specific in parts. Applying it to a different MLLM architecture requires validating hooks, visual-token indexing, and phase detection.
+- Report results only after running the complete method and baselines under a consistent evaluation protocol.
 
-Each output record retains the MCoT fields and adds:
+## References and acknowledgments
 
-```text
-methods
-activation_gate_trace
-saliency_trace
-```
+The repository implements and evaluates inference-time visual-entropy control, representation-level visual retracing, and gradient-based contextual verification in a unified research setting. We acknowledge the prior work relevant to these operations:
 
-`saliency_trace` records the adaptive threshold, candidate token IDs/text,
-saliency scores, rejected candidates, selected candidate, and whether the
-max-saliency fallback was used.  This is useful for debugging and ablations.
+1. **MCoT:**   [Code](https://github.com/ASGO-MM/MCoT-hallucination)
+2. **OTT:**  [Code](https://github.com/Fazhan-cs/OTT)
+3. **LVLMs-Saliency:**  [Paper](https://arxiv.org/abs/2601.20279) · [Code](https://github.com/zhangbaijin/LVLMs-Saliency)
+
+Please also respect the licenses and attribution requirements of upstream software used by the installation workflow.
+
+## Citation
+
+If you use RACER in your research, please cite the accompanying paper once its official preprint or proceedings record is available:
+
+> **RACER: Reasoning-Aware Coherence and Evidence Recalibration for Hallucination Mitigation in Multimodal Reasoning.**
+
+## Contact
+
+For implementation questions and research discussions, open an issue in this repository.

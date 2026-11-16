@@ -102,6 +102,10 @@ class SaliencyConfig:
     alpha_max: float = 0.95
     fallback_eta: Optional[float] = None   # N3.c  None = pure max-saliency
     exclude_neutral_history: bool = False  # N3.d
+    strict_grounding: bool = False  # independent support gates; port stays legacy
+    tau_visual: float = 0.25      # provisional relative visual floor
+    tau_text: float = 0.25        # provisional relative textual floor
+    no_grounding_action: str = "eos"  # abstain if no Top-K candidate has support
 
 
 @dataclass
@@ -298,6 +302,7 @@ def compute_candidate_saliency_parts(
     target_layers: Sequence[int],
     query_mode: str = "predictor",
     visual_positions: Optional[torch.Tensor] = None,
+    measure_first_visual: bool = False,
 ) -> Dict[str, object]:
     """
     Gradient-aware attention saliency |A * dL/dA| (head-mean, row-L2-normalised)
@@ -306,7 +311,7 @@ def compute_candidate_saliency_parts(
     """
     if query_mode not in {"predictor", "repo"}:
         raise ValueError("query_mode must be 'predictor' or 'repo'")
-    if seq.shape[-1] <= prompt_len:
+    if seq.shape[-1] <= prompt_len and not measure_first_visual:
         return {"txt": 1.0, "vis": None, "neutral": True}
 
     device = seq.device
@@ -372,16 +377,60 @@ def compute_candidate_saliency(model, base_inputs, seq, attention_mask, candidat
     )["txt"])
 
 
+def _relative_support(value, mean, eps: float = 1e-12) -> Optional[float]:
+    """Normalize against prior accepted history; use first observation at cold start.
+
+    A zero/missing measurement never becomes positive through normalization.
+    """
+    if value is None:
+        return None
+    value = float(value)
+    if not math.isfinite(value) or value < 0:
+        return None
+    baseline = float(mean) if mean is not None else None
+    if baseline is None or not math.isfinite(baseline) or baseline <= eps:
+        baseline = max(value, eps)
+    return value / baseline
+
+
+def _support_pass(parts: Dict[str, object], state: SaliencyState, cfg: SaliencyConfig) -> bool:
+    """Non-compensatory GSV constraint (used only for strict-grounding preset)."""
+    if not cfg.strict_grounding:
+        return True
+    v = _relative_support(parts.get("vis"), state.mean_vis(cfg.history_window))
+    if v is None or v < cfg.tau_visual:
+        return False
+    if not parts.get("neutral", False):
+        t = _relative_support(parts.get("txt"), state.mean_txt(cfg.history_window))
+        if t is None or t < cfg.tau_text:
+            return False
+    return True
+
+
 def _combined_score(parts: Dict[str, object], state: SaliencyState, cfg: SaliencyConfig) -> Tuple[float, Optional[float]]:
-    """Returns (score used for the test, relative score for logging/router)."""
+    """Returns (joint score for acceptance, relative score for router)."""
     mu_t = state.mean_txt(cfg.history_window)
     txt = float(parts["txt"])
     rel_t = txt / mu_t if mu_t and mu_t > 0 else None
     lam = float(cfg.visual_lambda)
     if lam <= 0:
-        return txt, rel_t
+        return txt, rel_t  # unchanged original text-only port
+
     mu_v = state.mean_vis(cfg.history_window)
     vis = parts.get("vis")
+    if cfg.strict_grounding:
+        rel_v = _relative_support(vis, mu_v)
+        if rel_v is None:
+            return float("-inf"), None  # missing visual evidence must fail
+        if parts.get("neutral", False):
+            return rel_v, rel_v  # no generated-text history at earliest steps
+        rel_t = _relative_support(txt, mu_t)
+        if rel_t is None:
+            return float("-inf"), None
+        joint = (1.0 - lam) * rel_t + lam * rel_v
+        return joint, joint
+
+    # Legacy behavior retained for reproducing old experiments / ablations.
     rel_v = (float(vis) / mu_v) if (vis is not None and mu_v and mu_v > 0) else None
     if rel_t is None and rel_v is None:
         return float("inf"), None
@@ -391,7 +440,6 @@ def _combined_score(parts: Dict[str, object], state: SaliencyState, cfg: Salienc
         return rel_t, rel_t
     rel = (1.0 - lam) * rel_t + lam * rel_v
     return rel, rel
-
 
 def _candidate_alpha(cid: int, cfg: SaliencyConfig, entropy_vec: Optional[torch.Tensor]) -> float:
     if cfg.entropy_kappa <= 0 or entropy_vec is None:
@@ -423,11 +471,25 @@ def select_sgrs_token(
     visual_positions: Optional[torch.Tensor] = None,
     entropy_vec: Optional[torch.Tensor] = None,
 ) -> Tuple[int, Dict]:
-    """Top-K -> (dual) saliency rejection with per-candidate threshold -> calibrated fallback."""
+    """Top-K GSV with non-compensatory visual/textual support when enabled.
+
+    A calibrated fallback may relax the joint score threshold, but never the
+    component-support constraints. If none has component support, emit EOS and
+    report abstention; do not misreport it as a GSV-verified candidate.
+    """
+    if config.strict_grounding:
+        if config.visual_lambda <= 0:
+            raise ValueError("strict GSV requires positive visual_lambda")
+        if not (0.0 < config.tau_visual and 0.0 < config.tau_text):
+            raise ValueError("strict GSV requires positive component-support thresholds")
+        if visual_positions is None or visual_positions.numel() == 0:
+            raise ValueError("strict GSV requires nonempty image-token positions")
+        if config.no_grounding_action not in {"eos", "error"}:
+            raise ValueError("no_grounding_action must be 'eos' or 'error'")
+
     layers = get_language_layers(model)
     target_layers = parse_layer_spec(config.target_layers, len(layers))
     vis_pos = visual_positions if config.visual_lambda > 0 else None
-
     probs = F.softmax(logits.float(), dim=-1).squeeze(0)
     k = min(int(config.top_k), int(probs.numel()))
     top_probs, top_ids = torch.topk(probs, k=k, dim=-1)
@@ -437,7 +499,8 @@ def select_sgrs_token(
 
     def evaluate(cid):
         return compute_candidate_saliency_parts(
-            model, base_inputs, seq, attention_mask, cid, prompt_len, target_layers, config.query_mode, vis_pos
+            model, base_inputs, seq, attention_mask, cid, prompt_len, target_layers,
+            config.query_mode, vis_pos, config.strict_grounding
         )
 
     remaining = list(candidates)
@@ -448,6 +511,13 @@ def select_sgrs_token(
     rejected: List[int] = []
     chosen: Optional[int] = None
     fallback = False
+    abstained = False
+
+    def evaluate_and_record(cid):
+        if cid not in parts:
+            parts[cid] = evaluate(cid)
+            scores[cid], rel[cid] = _combined_score(parts[cid], state, config)
+            taus[cid] = _threshold(cid, config, state, entropy_vec)
 
     for _ in range(int(config.max_resample)):
         if not remaining:
@@ -456,10 +526,8 @@ def select_sgrs_token(
         weights = weights / weights.sum().clamp_min(1e-12)
         pick = int(torch.multinomial(weights, 1, generator=generator).item())
         cid = remaining[pick]
-        parts[cid] = evaluate(cid)
-        scores[cid], rel[cid] = _combined_score(parts[cid], state, config)
-        taus[cid] = _threshold(cid, config, state, entropy_vec)
-        if scores[cid] >= taus[cid]:
+        evaluate_and_record(cid)
+        if scores[cid] >= taus[cid] and _support_pass(parts[cid], state, config):
             chosen = cid
             break
         rejected.append(cid)
@@ -468,35 +536,60 @@ def select_sgrs_token(
     if chosen is None:
         fallback = True
         for cid in candidates:
-            if cid not in parts:
-                parts[cid] = evaluate(cid)
-                scores[cid], rel[cid] = _combined_score(parts[cid], state, config)
-                taus[cid] = _threshold(cid, config, state, entropy_vec)
-        if config.fallback_eta is None:
-            chosen = max(candidates, key=lambda c: scores[c])
+            evaluate_and_record(cid)
+        eligible = [cid for cid in candidates if _support_pass(parts[cid], state, config)]
+        if config.strict_grounding and not eligible:
+            if config.no_grounding_action == "error":
+                raise RuntimeError("GSV: no Top-K candidate has measurable visual/textual support")
+            eos_id = getattr(tokenizer, "eos_token_id", None)
+            if isinstance(eos_id, (list, tuple)):
+                eos_id = eos_id[0] if eos_id else None
+            if eos_id is None:
+                raise RuntimeError("GSV abstention requires tokenizer.eos_token_id")
+            chosen = int(eos_id)
+            abstained = True
         else:
-            eta = float(config.fallback_eta)
-            chosen = max(
-                candidates,
-                key=lambda c: math.log(max(prob_map[c], 1e-12)) + eta * math.log(max(scores[c], 1e-12)),
-            )
+            pool = eligible if config.strict_grounding else candidates
+            if config.fallback_eta is None:
+                chosen = max(pool, key=lambda c: scores[c])
+            else:
+                eta = float(config.fallback_eta)
+                chosen = max(
+                    pool,
+                    key=lambda c: math.log(max(prob_map[c], 1e-12))
+                    + eta * math.log(max(scores[c], 1e-12)),
+                )
 
-    p = parts.get(chosen, {"txt": 1.0, "vis": None, "neutral": True})
-    if not (p.get("neutral") and config.exclude_neutral_history):
-        state.txt_hist.append(float(p["txt"]))
-        if p.get("vis") is not None:
+    # Record decisions against the pre-update running statistics.
+    support_map = {cid: _support_pass(parts[cid], state, config) for cid in parts}
+    chosen_support_pass = (not abstained) and support_map.get(chosen, False)
+    chosen_verified = chosen_support_pass and scores.get(chosen, float("-inf")) >= taus.get(chosen, float("inf"))
+    p = parts[chosen] if not abstained else {"txt": 0.0, "vis": None, "neutral": True}
+    if not abstained:
+        if not (p.get("neutral") and config.exclude_neutral_history):
+            state.txt_hist.append(float(p["txt"]))
+        # For strict grounding, collect measured visual history even when text is
+        # temporarily neutral, so later steps can use an actual visual reference.
+        if p.get("vis") is not None and (
+            config.strict_grounding or not (p.get("neutral") and config.exclude_neutral_history)
+        ):
             state.vis_hist.append(float(p["vis"]))
-    if not p.get("neutral"):
-        state.last_txt = float(p["txt"])
-        state.last_relative = rel.get(chosen)
+        if not p.get("neutral"):
+            state.last_txt = float(p["txt"])
+            state.last_relative = rel.get(chosen)
+        elif config.strict_grounding:
+            state.last_relative = rel.get(chosen)
 
     meta = {
         "chosen_id": int(chosen),
         "chosen_token": tokenizer.decode([int(chosen)], skip_special_tokens=False).replace("\n", "\\n"),
         "chosen_saliency": float(p["txt"]),
         "chosen_visual_saliency": p.get("vis"),
-        "chosen_relative": rel.get(chosen),
+        "chosen_relative": None if abstained else rel.get(chosen),
         "fallback": fallback,
+        "abstained": abstained,
+        "gsv_verified": chosen_verified,
+        "support_pass": chosen_support_pass,
         "rejected_ids": rejected,
         "candidates": [
             {
@@ -507,12 +600,12 @@ def select_sgrs_token(
                 "visual_saliency": parts[cid].get("vis") if cid in parts else None,
                 "score": scores.get(cid),
                 "threshold": taus.get(cid),
+                "support_pass": support_map.get(cid),
             }
             for cid in candidates
         ],
     }
     return int(chosen), meta
-
 
 @torch.no_grad()
 def attention_visual_priority(model, base_inputs: Dict[str, torch.Tensor], image_token_id: int, tail: int = 4) -> torch.Tensor:

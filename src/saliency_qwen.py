@@ -102,6 +102,8 @@ class SaliencyConfig:
     alpha_max: float = 0.95
     fallback_eta: Optional[float] = None   # N3.c  None = pure max-saliency
     exclude_neutral_history: bool = False  # N3.d
+    signed_saliency: bool = False   # proposed: preserve port behavior; enabled for ours
+    direction_min_ratio: float = 0.5  # require support > opposition
     strict_grounding: bool = False  # independent support gates; port stays legacy
     tau_visual: float = 0.25      # provisional relative visual floor
     tau_text: float = 0.25        # provisional relative textual floor
@@ -303,11 +305,12 @@ def compute_candidate_saliency_parts(
     query_mode: str = "predictor",
     visual_positions: Optional[torch.Tensor] = None,
     measure_first_visual: bool = False,
+    signed_saliency: bool = False,
 ) -> Dict[str, object]:
     """
-    Gradient-aware attention saliency |A * dL/dA| (head-mean, row-L2-normalised)
-    of one candidate.  Returns the text-history part (original method) and,
-    if visual_positions is given, the visual-grounding part (N3.a).
+    Candidate-conditioned attention sensitivity (head-mean, row-L2-normalised).
+    Legacy mode uses |A * dL/dA|. Signed mode separates supportive and opposing
+    dL/dz where z are pre-softmax attention logits. Neither implies causality.
     """
     if query_mode not in {"predictor", "repo"}:
         raise ValueError("query_mode must be 'predictor' or 'repo'")
@@ -335,6 +338,8 @@ def compute_candidate_saliency_parts(
 
         txt_scores: List[torch.Tensor] = []
         vis_scores: List[torch.Tensor] = []
+        txt_opposing: List[torch.Tensor] = []
+        vis_opposing: List[torch.Tensor] = []
         for layer_idx in target_layers:
             attn = attentions[layer_idx]
             if attn is None:
@@ -342,12 +347,26 @@ def compute_candidate_saliency_parts(
             grad = torch.autograd.grad(loss, attn, retain_graph=True, allow_unused=True, create_graph=False)[0]
             if grad is None:
                 continue
-            sal = (attn.float() * grad.float()).abs()
-            tq, tk = sal.shape[-2], sal.shape[-1]
-            tri = torch.tril(torch.ones((tq, tk), device=sal.device, dtype=sal.dtype))
-            sal = sal * tri.view(1, 1, tq, tk)
-            sal = sal.mean(dim=1)
-            sal = sal / sal.norm(p=2, dim=-1, keepdim=True).clamp_min(1e-9)
+            a, g = attn.float(), grad.float()
+            tq, tk = a.shape[-2], a.shape[-1]
+            tri = torch.tril(torch.ones((tq, tk), device=a.device,
+                                        dtype=a.dtype)).view(1, 1, tq, tk)
+            if signed_saliency:
+                # Softmax-consistent derivative w.r.t pre-softmax attention logits:
+                # dL/dz_j = A_j * (dL/dA_j - sum_k A_k * dL/dA_k)
+                # Unlike A*g, this accounts for redistribution between keys.
+                weighted = a * (g - (a * g).sum(dim=-1, keepdim=True))
+                # Split BEFORE head pooling to avoid cancellation across heads.
+                supp = (-weighted).clamp_min(0.0).mul(tri).mean(dim=1)
+                opp = weighted.clamp_min(0.0).mul(tri).mean(dim=1)
+                # Common denominator retains relative support/opposition strength.
+                denom = (supp + opp).norm(p=2, dim=-1, keepdim=True).clamp_min(1e-9)
+                sal, anti = supp / denom, opp / denom
+            else:
+                # EXACT original magnitude-only LVLMs-Saliency behavior.
+                sal = (a * g).abs().mul(tri).mean(dim=1)
+                sal = sal / sal.norm(p=2, dim=-1, keepdim=True).clamp_min(1e-9)
+                anti = None
             q_idx = tq - 2 if query_mode == "predictor" else tq - 1
             if q_idx < 0:
                 continue
@@ -357,16 +376,26 @@ def compute_candidate_saliency_parts(
                 neutral = True
             else:
                 txt_scores.append(sal[0, q_idx, hist_start:hist_end].mean())
+                if signed_saliency:
+                    txt_opposing.append(anti[0, q_idx, hist_start:hist_end].mean())
             if visual_positions is not None and visual_positions.numel() > 0:
-                vis_scores.append(sal[0, q_idx].index_select(0, visual_positions.to(sal.device)).mean())
+                pos = visual_positions.to(device=sal.device, dtype=torch.long)
+                vis_scores.append(sal[0, q_idx].index_select(0, pos).mean())
+                if signed_saliency:
+                    vis_opposing.append(anti[0, q_idx].index_select(0, pos).mean())
 
         if not txt_scores:
             raise RuntimeError("No usable attention gradients were produced for SGRS (check eager attention).")
         txt = float(torch.stack(txt_scores).mean().detach().cpu().item())
         vis = float(torch.stack(vis_scores).mean().detach().cpu().item()) if vis_scores else None
+        txt_opp = (float(torch.stack(txt_opposing).mean().detach().cpu().item())
+                   if txt_opposing else (0.0 if signed_saliency and neutral else None))
+        vis_opp = (float(torch.stack(vis_opposing).mean().detach().cpu().item())
+                   if vis_opposing else None)
 
     model.zero_grad(set_to_none=True)
-    return {"txt": txt, "vis": vis, "neutral": neutral}
+    return {"txt": txt, "vis": vis, "txt_opp": txt_opp,
+            "vis_opp": vis_opp, "neutral": neutral}
 
 
 def compute_candidate_saliency(model, base_inputs, seq, attention_mask, candidate_id, prompt_len,
@@ -393,6 +422,16 @@ def _relative_support(value, mean, eps: float = 1e-12) -> Optional[float]:
     return value / baseline
 
 
+def _directionally_supportive(positive, opposing, floor: float = 0.5) -> bool:
+    """Reject missing, zero, or opposition-dominated evidence."""
+    if positive is None or opposing is None:
+        return False
+    pos, neg = float(positive), float(opposing)
+    if not (math.isfinite(pos) and math.isfinite(neg)) or pos <= 0 or neg < 0:
+        return False
+    return pos / max(pos + neg, 1e-12) > float(floor)
+
+
 def _support_pass(parts: Dict[str, object], state: SaliencyState, cfg: SaliencyConfig) -> bool:
     """Non-compensatory GSV constraint (used only for strict-grounding preset)."""
     if not cfg.strict_grounding:
@@ -400,9 +439,17 @@ def _support_pass(parts: Dict[str, object], state: SaliencyState, cfg: SaliencyC
     v = _relative_support(parts.get("vis"), state.mean_vis(cfg.history_window))
     if v is None or v < cfg.tau_visual:
         return False
+    if cfg.signed_saliency and not _directionally_supportive(
+        parts.get("vis"), parts.get("vis_opp"), cfg.direction_min_ratio
+    ):
+        return False
     if not parts.get("neutral", False):
         t = _relative_support(parts.get("txt"), state.mean_txt(cfg.history_window))
         if t is None or t < cfg.tau_text:
+            return False
+        if cfg.signed_saliency and not _directionally_supportive(
+            parts.get("txt"), parts.get("txt_opp"), cfg.direction_min_ratio
+        ):
             return False
     return True
 
@@ -477,6 +524,10 @@ def select_sgrs_token(
     component-support constraints. If none has component support, emit EOS and
     report abstention; do not misreport it as a GSV-verified candidate.
     """
+    if config.signed_saliency and not config.strict_grounding:
+        raise ValueError("signed GSV requires strict_grounding=True")
+    if config.signed_saliency and not (0.0 <= config.direction_min_ratio < 1.0):
+        raise ValueError("direction_min_ratio must lie in [0, 1)")
     if config.strict_grounding:
         if config.visual_lambda <= 0:
             raise ValueError("strict GSV requires positive visual_lambda")
@@ -500,7 +551,7 @@ def select_sgrs_token(
     def evaluate(cid):
         return compute_candidate_saliency_parts(
             model, base_inputs, seq, attention_mask, cid, prompt_len, target_layers,
-            config.query_mode, vis_pos, config.strict_grounding
+            config.query_mode, vis_pos, config.strict_grounding, config.signed_saliency
         )
 
     remaining = list(candidates)
@@ -585,6 +636,8 @@ def select_sgrs_token(
         "chosen_token": tokenizer.decode([int(chosen)], skip_special_tokens=False).replace("\n", "\\n"),
         "chosen_saliency": float(p["txt"]),
         "chosen_visual_saliency": p.get("vis"),
+        "chosen_visual_opposing_saliency": p.get("vis_opp"),
+        "chosen_text_opposing_saliency": p.get("txt_opp"),
         "chosen_relative": None if abstained else rel.get(chosen),
         "fallback": fallback,
         "abstained": abstained,
@@ -598,6 +651,8 @@ def select_sgrs_token(
                 "topk_prob": prob_map[cid],
                 "saliency": parts[cid]["txt"] if cid in parts else None,
                 "visual_saliency": parts[cid].get("vis") if cid in parts else None,
+                "visual_opposing_saliency": parts[cid].get("vis_opp") if cid in parts else None,
+                "text_opposing_saliency": parts[cid].get("txt_opp") if cid in parts else None,
                 "score": scores.get(cid),
                 "threshold": taus.get(cid),
                 "support_pass": support_map.get(cid),

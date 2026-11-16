@@ -41,6 +41,7 @@ PRESETS: Dict[str, Dict[str, object]] = {
         ott_svc_ref_space="residual", ott_relevance_gate=False,
         sgrs_visual_lambda=0.0, sgrs_entropy_kappa=0.0, sgrs_fallback_eta="none", sgrs_exclude_neutral=False,
         sgrs_strict_grounding=False, sgrs_tau_visual=0.25, sgrs_tau_text=0.25, sgrs_no_grounding_action="eos",
+        sgrs_signed_saliency=False, sgrs_direction_min_ratio=0.5,
         locore_adaptive=False, locore_beta_max=0.60, locore_visual_beta=0.0, locore_visual_anchor_k=32,
         router="always", risk_threshold=0.5, risk_w_entropy=0.5, risk_w_saliency=0.3, risk_w_conf=0.2,
         risk_confident_skip=1.01, risk_retrace=True,
@@ -52,6 +53,7 @@ PRESETS: Dict[str, Dict[str, object]] = {
         ott_svc_ref_space="mlp", ott_relevance_gate=True,
         sgrs_visual_lambda=0.3, sgrs_entropy_kappa=0.5, sgrs_fallback_eta="1.0", sgrs_exclude_neutral=True,
         sgrs_strict_grounding=True, sgrs_tau_visual=0.25, sgrs_tau_text=0.25, sgrs_no_grounding_action="eos",
+        sgrs_signed_saliency=True, sgrs_direction_min_ratio=0.5,
         locore_adaptive=True, locore_beta_max=0.60, locore_visual_beta=0.10, locore_visual_anchor_k=32,
         router="risk", risk_threshold=0.5, risk_w_entropy=0.5, risk_w_saliency=0.3, risk_w_conf=0.2,
         risk_confident_skip=0.95, risk_retrace=True,
@@ -296,6 +298,8 @@ def build_parser():
     p.add_argument("--sgrs_fallback_eta", default=None, help="float, or 'none' for pure max-saliency")
     p.add_argument("--sgrs_exclude_neutral", type=str2bool, default=None)
     p.add_argument("--sgrs_strict_grounding", type=str2bool, default=None)
+    p.add_argument("--sgrs_signed_saliency", type=str2bool, default=None)
+    p.add_argument("--sgrs_direction_min_ratio", type=float, default=None)
     p.add_argument("--sgrs_tau_visual", type=float, default=None)
     p.add_argument("--sgrs_tau_text", type=float, default=None)
     p.add_argument("--sgrs_no_grounding_action", choices=["eos", "error"], default=None)
@@ -369,7 +373,10 @@ def build_components(model, args, methods):
         query_mode=args.saliency_query_mode, visual_lambda=args.sgrs_visual_lambda,
         entropy_kappa=args.sgrs_entropy_kappa, entropy_gamma=args.activation_threshold,
         fallback_eta=args.sgrs_fallback_eta, exclude_neutral_history=args.sgrs_exclude_neutral,
-        strict_grounding=args.sgrs_strict_grounding, tau_visual=args.sgrs_tau_visual,
+        strict_grounding=args.sgrs_strict_grounding,
+        signed_saliency=args.sgrs_signed_saliency,
+        direction_min_ratio=args.sgrs_direction_min_ratio,
+        tau_visual=args.sgrs_tau_visual,
         tau_text=args.sgrs_tau_text, no_grounding_action=args.sgrs_no_grounding_action,
     )
     router = RiskRouter(RouterConfig(
